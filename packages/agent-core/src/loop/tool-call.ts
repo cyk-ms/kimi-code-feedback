@@ -232,6 +232,57 @@ export async function recordUnexecutedToolCalls(
   }
 }
 
+
+/**
+ * 模型偶发对非负整数参数生成非法值（如 timeout: -30），拒绝后模型往往陷入
+ * 重复失败循环（思考里声明要修正、实际调用仍是同一个非法值）。对"schema 要求
+ * 非负且带数值默认值"的字段，直接用默认值纠正后继续执行，而不是拒绝。
+ * 仅处理数值字段；路径、内容等不可猜测的字段不在此列。
+ */
+function coerceNonNegativeIntArgs(
+  tool: ExecutableTool,
+  args: unknown,
+): { args: unknown; corrections: string[] } {
+  const corrections: string[] = [];
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    return { args, corrections };
+  }
+  const props = (tool.parameters as { properties?: Record<string, unknown> } | undefined)
+    ?.properties;
+  if (!props) return { args, corrections };
+  const out = { ...(args as Record<string, unknown>) };
+  for (const [key, rawSchema] of Object.entries(props)) {
+    const schema = rawSchema as {
+      type?: string;
+      exclusiveMinimum?: number;
+      minimum?: number;
+      default?: unknown;
+    };
+    if (!schema || (schema.type !== 'integer' && schema.type !== 'number')) continue;
+    const value = out[key];
+    if (typeof value !== 'number') continue;
+    // 只处理"要求非负"的字段：exclusiveMinimum >= 0 或 minimum >= 0
+    const floor =
+      typeof schema.exclusiveMinimum === 'number'
+        ? { bound: schema.exclusiveMinimum, inclusive: false }
+        : typeof schema.minimum === 'number'
+          ? { bound: schema.minimum, inclusive: true }
+          : undefined;
+    if (!floor || floor.bound < 0) continue;
+    const violates = floor.inclusive ? value < floor.bound : value <= floor.bound;
+    if (!violates) continue;
+    const replacement =
+      typeof schema.default === 'number'
+        ? schema.default
+        : floor.inclusive
+          ? floor.bound
+          : floor.bound + 1;
+    corrections.push(`${key}: ${value} -> ${replacement} (schema default)`);
+    out[key] = replacement;
+  }
+  return { args: out, corrections };
+}
+
 /**
  * Provider-order validation pass. It does not run hooks, spawn tools, or write
  * events. Validator compilation may populate the local cache.
@@ -262,17 +313,26 @@ function preflightToolCall(
     });
   }
 
-  const validationError = validateExecutableToolArgs(tool, parsedArgs.data);
+  const coerced = coerceNonNegativeIntArgs(tool, parsedArgs.data);
+  if (coerced.corrections.length > 0) {
+    step.log?.warn('tool args coerced to schema defaults', {
+      toolName,
+      toolCallId: toolCall.id,
+      corrections: coerced.corrections,
+    });
+  }
+
+  const validationError = validateExecutableToolArgs(tool, coerced.args);
   if (validationError !== null) {
     return {
       kind: 'rejected',
       toolCall,
       toolName,
-      args: parsedArgs.data,
+      args: coerced.args,
       output: `Invalid args for tool "${toolName}": ${validationError}`,
     };
   }
-  return { kind: 'runnable', toolCall, toolName, tool, args: parsedArgs.data };
+  return { kind: 'runnable', toolCall, toolName, tool, args: coerced.args };
 }
 
 function validateExecutableToolArgs(tool: ExecutableTool, args: unknown): string | null {
